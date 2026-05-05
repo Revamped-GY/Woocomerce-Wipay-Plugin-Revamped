@@ -1,0 +1,78 @@
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor and IDE settings
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+nbproject/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Build artefacts
+*.zip
+*.tar
+*.tar.gz
+build/
+dist/
+release/
+
+# Dependency folders
+node_modules/
+vendor/
+composer.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# WordPress cache and temporary files
+*.log
+debug.log
+error_log
+wp-content/cache/
+wp-content/upgrade/
+wp-content/uploads/
+
+# PHP debug and test artefacts
+.phpunit.result.cache
+.phpunit.cache/
+coverage/
+phpcs.cache
+phpstan.neon
+.php-cs-fixer.cache
+.phpunit.cache
+
+# Local notes and drafts
+notes/
+drafts/
+TODO.local.md
+*.local.md
+
+# Claude Code project instructions (kept local for reference, not published)
+CLAUDE.md
+.claude/
+
+# Backup files
+*.bak
+*.backup
+*.orig
+*.old
+
+# WordPress translation working files
+*.mo
+languages/*.po~
