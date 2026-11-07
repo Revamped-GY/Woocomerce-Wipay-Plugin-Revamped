@@ -1,18 +1,21 @@
 <?php
 /**
  * Plugin Name: Revamped WiPay Gateway for WooCommerce
- * Plugin URI: https://revamped.gy/plugins/revamped-wipay-gateway-for-woocommerce/
+ * Plugin URI: https://revamped.gy/wipay-woocommerce-plugin/
  * Description: Accept card payments via WiPay by redirecting customers to WiPay's hosted payment page, then confirming payment back in WooCommerce.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: Revamped GY
  * Author URI: https://revamped.gy
+ * License: GPLv2 or later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: revamped-wipay-woocommerce
  * Domain Path: /languages
  * Requires at least: 6.0
  * Requires PHP: 7.4
+ * Update URI: https://github.com/Revamped-GY/Woocomerce-Wipay-Plugin-Revamped
  *
  * WC requires at least: 6.0
- * WC tested up to: 9.0
+ * WC tested up to: 11.2
  *
  * @package Revamped_WiPay_WooCommerce
  */
@@ -22,7 +25,7 @@ if (!defined('ABSPATH')) {
 }
 
 if (!defined('RGY_WIPAY_WC_VERSION')) {
-    define('RGY_WIPAY_WC_VERSION', '1.2.0');
+    define('RGY_WIPAY_WC_VERSION', '1.3.0');
 }
 if (!defined('RGY_WIPAY_WC_FILE')) {
     define('RGY_WIPAY_WC_FILE', __FILE__);
@@ -40,10 +43,13 @@ if (!defined('RGY_WIPAY_LOGO_URL')) {
 }
 
 if (!defined('RGY_WIPAY_GITHUB_REPO')) {
-    // GitHub repo in owner/repo format. Releases published on this repo
-    // become available updates inside WordPress automatically.
-    // Override at runtime with the rgy_wipay_github_repo filter.
-    define('RGY_WIPAY_GITHUB_REPO', 'RevampedGY/revamped-wipay-woocommerce');
+    // Releases published on this repository are offered as updates.
+    define('RGY_WIPAY_GITHUB_REPO', 'Revamped-GY/Woocomerce-Wipay-Plugin-Revamped');
+}
+
+if (!defined('RGY_WIPAY_UPDATE_JSON_URL')) {
+    // Used when GitHub cannot be reached. Versions before 1.3.0 read only this file.
+    define('RGY_WIPAY_UPDATE_JSON_URL', 'https://revamped.gy/updates/revamped-wipay-woocommerce.json');
 }
 
 require_once RGY_WIPAY_WC_PATH . 'includes/class-rgy-wipay-admin.php';
@@ -74,6 +80,8 @@ final class RGY_WiPay_WooCommerce_Plugin {
     }
 
     public function init() {
+        rgy_wipay_schedule_cleanup();
+
         // Updater should run even if WooCommerce is inactive.
         if (class_exists('RGY_WiPay_Updater')) {
             RGY_WiPay_Updater::instance();
@@ -138,7 +146,15 @@ RGY_WiPay_WooCommerce_Plugin::instance();
 
 register_activation_hook(RGY_WIPAY_WC_FILE, 'rgy_wipay_activate');
 function rgy_wipay_activate() {
-    if (!wp_next_scheduled('rgy_wipay_cleanup_pending_orders')) {
+    rgy_wipay_schedule_cleanup();
+}
+
+/**
+ * Activation hooks do not run when a plugin is updated, so sites that came
+ * from an older version are scheduled here as well.
+ */
+function rgy_wipay_schedule_cleanup() {
+    if (function_exists('wp_next_scheduled') && !wp_next_scheduled('rgy_wipay_cleanup_pending_orders')) {
         wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'rgy_wipay_cleanup_pending_orders');
     }
 }
@@ -154,13 +170,17 @@ function rgy_wipay_do_cleanup_pending_orders() {
         return;
     }
 
-    $cutoff = absint(apply_filters('rgy_wipay_pending_order_max_age', 4 * HOUR_IN_SECONDS));
-    $cutoff_date = gmdate('Y-m-d H:i:s', time() - $cutoff);
+    $max_age = absint(apply_filters('rgy_wipay_pending_order_max_age', 4 * HOUR_IN_SECONDS));
+    if ($max_age < HOUR_IN_SECONDS) {
+        $max_age = HOUR_IN_SECONDS;
+    }
 
+    // A timestamp keeps the comparison to the second. A date string is
+    // compared by day only.
     $orders = wc_get_orders(array(
         'status'         => 'pending',
         'payment_method' => 'rgy_wipay',
-        'date_created'   => '<' . $cutoff_date,
+        'date_created'   => '<' . (time() - $max_age),
         'limit'          => 50,
         'return'         => 'ids',
     ));

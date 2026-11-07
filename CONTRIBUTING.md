@@ -73,7 +73,7 @@ Comments should explain the why, not the what. Most code should be readable with
 
 Before opening a pull request, confirm:
 
-- All PHP files lint cleanly. Run `php -l` on each file or use the project lint script if available.
+- All PHP files lint cleanly and `php tests/run-updater-tests.php` passes.
 - The plugin activates without warnings on a fresh WordPress install with WooCommerce.
 - Sandbox payments still complete end to end.
 - The Overview and Help pages render without warnings on PHP 7.4 and PHP 8.x.
@@ -82,13 +82,9 @@ Before opening a pull request, confirm:
 
 ## Releasing a new version
 
-Releases are published on GitHub Releases. The plugin checks the latest release tag and uses the attached ZIP asset as the update package.
-
-The release process is documented in the maintainer notes. The short version:
-
-1. Update the version in the main plugin file, the version constant, the readme and the changelog.
-2. Tag the commit as `vX.Y.Z`.
-3. The release workflow builds the ZIP and attaches it to the release.
+1. Update the version in the main plugin file, the version constant, the readme Stable tag and both changelogs.
+2. Run `php tests/run-updater-tests.php`.
+3. Push to `main`. The release workflow checks the version numbers agree, builds the ZIP and its SHA-256 file, and publishes the GitHub Release that installed copies update from.
 
 ## Code of conduct
 

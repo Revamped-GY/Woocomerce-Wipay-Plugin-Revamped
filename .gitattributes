@@ -27,5 +27,5 @@
 .gitignore export-ignore
 .gitattributes export-ignore
 .github export-ignore
+tests export-ignore
 CONTRIBUTING.md export-ignore
-CLAUDE.md export-ignore

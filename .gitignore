@@ -63,10 +63,6 @@ drafts/
 TODO.local.md
 *.local.md
 
-# Claude Code project instructions (kept local for reference, not published)
-CLAUDE.md
-.claude/
-
 # Backup files
 *.bak
 *.backup
