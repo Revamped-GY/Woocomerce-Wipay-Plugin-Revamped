@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.2.x   | Yes       |
+| 1.3.x   | Yes       |
+| 1.2.x   | No        |
 | 1.1.x   | No        |
 | < 1.1   | No        |
 
@@ -71,9 +72,14 @@ When configuring this plugin:
 The plugin already enforces several controls on the return endpoint:
 
 - A signed HMAC-SHA256 token with a 4 hour expiry, validated before any payment status is accepted
-- A hash check on successful responses using the WiPay API key, required in Live mode
+- A hash check on every successful response using the WiPay API key
+- One WiPay transaction can pay only one order
 - Order ID, currency and transaction ID matching against the values stored at request time
 - Replay protection so a paid order cannot be reprocessed with a different transaction ID
 - Per order plus IP rate limiting on the return handler
 
 If you find a way to bypass any of these, please report it privately using the steps above.
+
+## Update integrity
+
+Each release carries `revamped-wipay-woocommerce-vX.Y.Z.zip` and a `.zip.sha256` file. The plugin downloads the package and compares its SHA-256 value before WordPress unpacks it, and refuses a package that is missing a checksum or does not match. The `Update URI` header stops WordPress offering a wordpress.org plugin with the same slug.

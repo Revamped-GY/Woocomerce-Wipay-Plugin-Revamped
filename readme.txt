@@ -2,9 +2,9 @@
 Contributors: revampedgy
 Tags: wipay, payments, credit card, woocommerce, checkout
 Requires at least: 6.0
-Tested up to: 6.7
+Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.3.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -24,7 +24,7 @@ Features:
 * Optional card type selection to skip WiPay card type screen
 * WooCommerce Blocks Checkout compatibility
 * Optional debug logging in WooCommerce logs
-* Self hosted updates via native WordPress updater using an Update JSON file
+* Updates through the WordPress updater from GitHub Releases, checked by SHA-256 before install
 
 == Installation ==
 
@@ -36,8 +36,11 @@ Features:
 
 == Frequently Asked Questions ==
 
-= How do I enable self hosted updates? =
-Upload the update JSON file to /updates/revamped-wipay-woocommerce.json on your site. The plugin uses the native WordPress updater and checks that JSON for new versions. When you release an update, upload the new ZIP then overwrite the JSON file with the new version, download_url and changelog.
+= How do updates work? =
+New versions are published as GitHub Releases. WordPress shows them on the Plugins screen like any other update, and you can turn on auto-updates there. Each package is checked against its published SHA-256 value before it is installed. If GitHub cannot be reached, the plugin reads the update file on revamped.gy instead.
+
+= How do I refund a WiPay payment? =
+WiPay has no refund API. Refund the payment in your WiPay Business dashboard, then use Refund manually on the WooCommerce order.
 
 = Where do I enter my WiPay credentials? =
 Go to WooCommerce > Settings > Payments > WiPay. Enter your account number and API key for the selected environment.
@@ -62,6 +65,17 @@ WooCommerce > Status > Logs. Look for the log source "rgy-wipay" if debug loggin
 
 == Changelog ==
 
+= 1.3.0 =
+* Security: a successful return always needs a valid WiPay hash
+* Security: one WiPay transaction can pay only one order
+* Security: updates are checked against the release SHA-256 value before install
+* Security: added the Update URI header
+* Fixed updates for copies installed from GitHub
+* Fixed the stale pending order clean-up for sites that updated from an older version
+* Fixed the Plugin URI
+* WiPay is hidden at checkout when the store currency cannot be charged
+* Removed the refund button that always returned an error
+* Tested with WordPress 7.1 and WooCommerce 11.2
 = 1.2.0 =
 * Fixed billing prefill field names to match WiPay API (fname, lname, addr1, addr2, zipcode)
 * Fixed Overview page reading wrong settings keys for country and account number

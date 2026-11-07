@@ -39,9 +39,11 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
         // Classic checkout icon is rendered via get_icon() to control size.
         $this->icon = '';
 
+        // WiPay has no refund API. Without 'refunds' WooCommerce offers only
+        // "Refund manually", which is the step merchants need after refunding
+        // in the WiPay dashboard.
         $this->supports = array(
             'products',
-            'refunds',
         );
 
         $this->init_form_fields();
@@ -308,6 +310,12 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
         $from_currency = strtoupper((string) $from_currency);
         $fallback_key = 'rgy_wipay_fx_fallback_' . strtolower($from_currency) . '_usd';
         $fallback = get_option($fallback_key);
+        $max_age = absint(apply_filters('rgy_wipay_fx_fallback_max_age', 7 * DAY_IN_SECONDS));
+        $fetched_at = is_array($fallback) && isset($fallback['fetched_at']) ? absint($fallback['fetched_at']) : 0;
+        if ($max_age && (!$fetched_at || (time() - $fetched_at) > $max_age)) {
+            $this->log('Stored FX rate for ' . $from_currency . ' is too old to use.', 'error');
+            return null;
+        }
         if (is_array($fallback) && !empty($fallback['rate']) && is_numeric($fallback['rate'])) {
             $this->log('Using fallback FX rate for ' . $from_currency . '. rate=' . $fallback['rate'] . ' fetched_at=' . (isset($fallback['fetched_at']) ? $fallback['fetched_at'] : '?'), 'warning');
             return (float) $fallback['rate'];
@@ -443,7 +451,7 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
         $country  = strtolower(trim((string) $this->get_option('country', 'gy')));
 
         $base = '';
-        if ($override) {
+        if ($override && 'https' === strtolower((string) wp_parse_url($override, PHP_URL_SCHEME))) {
             $base = rtrim($override, '/');
         } else {
             $country = preg_replace('/[^a-z]/', '', $country);
@@ -473,7 +481,48 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
             return false;
         }
 
+        // Do not offer a method that can only fail at Place order. The Overview
+        // page tells the store owner to switch Charge currency to USD.
+        if ('store' === $this->get_charge_currency_option() && !self::is_supported_currency($this->get_checkout_currency())) {
+            return false;
+        }
+
         return true;
+    }
+
+    private function get_charge_currency_option() {
+        $value = (string) $this->get_option('charge_currency', 'store');
+        return in_array($value, array('store', 'usd'), true) ? $value : 'store';
+    }
+
+    private function get_checkout_currency() {
+        $currency = '';
+        if (is_admin() && !wp_doing_ajax()) {
+            return '';
+        }
+        $order_id = absint(get_query_var('order-pay'));
+        if ($order_id) {
+            $order = wc_get_order($order_id);
+            if ($order) {
+                $currency = (string) $order->get_currency();
+            }
+        }
+        if ('' === $currency && function_exists('get_woocommerce_currency')) {
+            $currency = (string) get_woocommerce_currency();
+        }
+        return strtoupper($currency);
+    }
+
+    /**
+     * Currencies WiPay accepts for card payments.
+     */
+    public static function supported_currencies() {
+        return (array) apply_filters('rgy_wipay_supported_currencies', array('JMD', 'TTD', 'USD'));
+    }
+
+    public static function is_supported_currency($currency) {
+        $currency = strtoupper((string) $currency);
+        return '' === $currency || in_array($currency, self::supported_currencies(), true);
     }
 
     public function process_payment($order_id) {
@@ -499,11 +548,9 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
         $wipay_order_id = 'wc_' . $id_str . '_' . substr($order_key, 0, $key_len);
 
         // Validate store currency is supported when sending as-is.
-        $charge_currency_opt = (string) $this->get_option('charge_currency', 'store');
-        if ('store' === $charge_currency_opt || '' === $charge_currency_opt) {
-            $wipay_currencies = array('JMD', 'TTD', 'USD');
+        if ('store' === $this->get_charge_currency_option()) {
             $order_currency = strtoupper((string) $order->get_currency());
-            if ($order_currency && !in_array($order_currency, $wipay_currencies, true)) {
+            if ($order_currency && !self::is_supported_currency($order_currency)) {
                 wc_add_notice(
                     sprintf(
                         /* translators: %s: store currency code */
@@ -651,12 +698,17 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
         $this->log('WiPay response code=' . $code . ' body=' . $raw_log);
 
         $data = json_decode($raw, true);
-        if (!is_array($data) || empty($data['url'])) {
+        if (!is_array($data) || empty($data['url']) || !is_string($data['url'])) {
             wc_add_notice(__('WiPay did not return a payment URL. Please try again.', 'revamped-wipay-woocommerce'), 'error');
             return array('result' => 'fail');
         }
 
-        $wipay_url = esc_url_raw($data['url']);
+        $wipay_url = esc_url_raw($data['url'], array('https'));
+        if ('' === $wipay_url) {
+            $this->log('WiPay returned a payment URL that is not HTTPS for order #' . $order->get_id(), 'error');
+            wc_add_notice(__('WiPay did not return a payment URL. Please try again.', 'revamped-wipay-woocommerce'), 'error');
+            return array('result' => 'fail');
+        }
         $request_transaction_id = isset($data['transaction_id']) ? sanitize_text_field($data['transaction_id']) : '';
 
         $order->update_meta_data(self::META_WIPAY_ORDER_ID, $wipay_order_id);
@@ -715,9 +767,92 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
             );
         }
 
+        // Same default as get_api_key(): the public sandbox key.
+        $sandbox = isset($settings['api_key_sandbox']) ? (string) $settings['api_key_sandbox'] : '';
         return array(
-            'api_key' => isset($settings['api_key_sandbox']) ? (string) $settings['api_key_sandbox'] : '123',
+            'api_key' => '' !== $sandbox ? $sandbox : '123',
         );
+    }
+
+    /**
+     * Short lock in the options table. INSERT IGNORE succeeds for one request
+     * only, so two returns for the same transaction cannot both complete an
+     * order.
+     */
+    private static function acquire_lock($name, $ttl = 120) {
+        global $wpdb;
+        $key = 'rgy_wipay_lock_' . hash('sha256', (string) $name);
+        $value = time() . '|' . wp_generate_password(20, false, false);
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+        $inserted = $wpdb->query($wpdb->prepare(
+            "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            $key,
+            $value
+        ));
+        if (1 !== (int) $inserted) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+            $current = (string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $key));
+            $created = (int) strtok($current, '|');
+            if ('' === $current || ($created > 0 && (time() - $created) <= $ttl)) {
+                return array();
+            }
+            // Take over a lock left behind by a request that died.
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+            $updated = $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+                $value,
+                $key,
+                $current
+            ));
+            if (1 !== (int) $updated) {
+                return array();
+            }
+        }
+        wp_cache_delete($key, 'options');
+        wp_cache_delete('notoptions', 'options');
+        return array('key' => $key, 'value' => $value);
+    }
+
+    private static function release_lock($lock) {
+        global $wpdb;
+        if (empty($lock['key']) || empty($lock['value'])) {
+            return;
+        }
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+            $lock['key'],
+            $lock['value']
+        ));
+        wp_cache_delete($lock['key'], 'options');
+    }
+
+    /**
+     * IDs of other orders already paid with this WiPay transaction.
+     */
+    private static function orders_paid_with_transaction($transaction_id, $exclude_order_id) {
+        $ids = array();
+        $by_transaction = wc_get_orders(array(
+            'transaction_id' => $transaction_id,
+            'limit'          => 5,
+            'return'         => 'ids',
+            'status'         => array_keys(wc_get_order_statuses()),
+        ));
+        $by_meta = wc_get_orders(array(
+            'meta_key'   => self::META_PAID_TRANSACTION_ID,
+            'meta_value' => $transaction_id,
+            'limit'      => 5,
+            'return'     => 'ids',
+            'status'     => array_keys(wc_get_order_statuses()),
+        ));
+        foreach (array_merge((array) $by_transaction, (array) $by_meta) as $id) {
+            $id = absint($id);
+            if ($id && $id !== absint($exclude_order_id)) {
+                $ids[$id] = $id;
+            }
+        }
+        return array_values($ids);
     }
 
 
@@ -851,7 +986,7 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
         $token = isset($_GET['token']) ? sanitize_text_field(wp_unslash($_GET['token'])) : '';
 
         $order = $order_id ? wc_get_order($order_id) : false;
-        if (!$order) {
+        if (!$order || 'rgy_wipay' !== $order->get_payment_method()) {
             wc_add_notice(__('Payment error. Order not found.', 'revamped-wipay-woocommerce'), 'error');
             wp_safe_redirect(wc_get_checkout_url());
             exit;
@@ -989,45 +1124,100 @@ class RGY_WiPay_Gateway extends WC_Payment_Gateway {
                 exit;
             }
 
-            // Hash validation is required for successful responses when an API key is configured.
+            // The hash is the only proof that WiPay produced this response, so a
+            // success without a key or a hash is never accepted.
             $settings = self::get_settings_for_env($env);
             $api_key = isset($settings['api_key']) ? (string) $settings['api_key'] : '';
 
-            if ($api_key) {
-                if (!$hash) {
-                    $order->update_status('failed', __('WiPay hash was missing on a successful response.', 'revamped-wipay-woocommerce'));
-                    wc_add_notice(__('Payment verification failed. Please contact the store owner.', 'revamped-wipay-woocommerce'), 'error');
-                    wp_safe_redirect(wc_get_checkout_url());
-                    exit;
-                }
-
-                // MD5 hash algorithm is specified by the WiPay API.
-                $expected = md5($transaction_id . $original_total . $api_key);
-                if (!hash_equals($expected, $hash)) {
-                    $order->update_status('failed', __('WiPay hash validation failed.', 'revamped-wipay-woocommerce'));
-                    wc_add_notice(__('Payment verification failed. Please contact the store owner.', 'revamped-wipay-woocommerce'), 'error');
-                    wp_safe_redirect(wc_get_checkout_url());
-                    exit;
-                }
+            if ('' === $api_key) {
+                $order->add_order_note(__('WiPay returned success but no API key is saved for this environment, so the response could not be checked. The order was not marked paid.', 'revamped-wipay-woocommerce'));
+                wc_add_notice(__('Payment verification failed. Please contact the store owner.', 'revamped-wipay-woocommerce'), 'error');
+                wp_safe_redirect(wc_get_checkout_url());
+                exit;
             }
 
-            $order->payment_complete($transaction_id);
-            $order->update_meta_data(self::META_PAID_TRANSACTION_ID, $transaction_id);
-            $order->save();
+            if (!$hash) {
+                $order->update_status('failed', __('WiPay hash was missing on a successful response.', 'revamped-wipay-woocommerce'));
+                wc_add_notice(__('Payment verification failed. Please contact the store owner.', 'revamped-wipay-woocommerce'), 'error');
+                wp_safe_redirect(wc_get_checkout_url());
+                exit;
+            }
 
-            $order->add_order_note(sprintf(
-                /* translators: 1: transaction id, 2: message */
-                __('WiPay payment completed. Transaction ID: %1$s. Message: %2$s', 'revamped-wipay-woocommerce'),
-                $transaction_id ? $transaction_id : '-',
-                $message ? $message : '-'
-            ));
+            // MD5 hash algorithm is specified by the WiPay API.
+            $expected = md5($transaction_id . $original_total . $api_key);
+            if (!hash_equals($expected, strtolower($hash))) {
+                $order->update_status('failed', __('WiPay hash validation failed.', 'revamped-wipay-woocommerce'));
+                wc_add_notice(__('Payment verification failed. Please contact the store owner.', 'revamped-wipay-woocommerce'), 'error');
+                wp_safe_redirect(wc_get_checkout_url());
+                exit;
+            }
 
-            wp_safe_redirect($order->get_checkout_order_received_url());
+            // One WiPay transaction pays one order. The lock stops two returns
+            // carrying the same transaction from completing two orders at once.
+            $lock = self::acquire_lock('tx|' . $transaction_id);
+            if (empty($lock)) {
+                wc_add_notice(__('Your payment is being confirmed. Please wait a moment, then check your order.', 'revamped-wipay-woocommerce'), 'notice');
+                wp_safe_redirect($order->get_checkout_order_received_url());
+                exit;
+            }
+
+            // exit inside try would skip finally, so the redirect happens after
+            // the lock is released.
+            $redirect = '';
+            try {
+                $order = wc_get_order($order_id);
+                if (!$order) {
+                    $redirect = wc_get_checkout_url();
+                } elseif ($order->is_paid()) {
+                    $redirect = $order->get_checkout_order_received_url();
+                } else {
+                    $other_orders = self::orders_paid_with_transaction($transaction_id, $order_id);
+                    if (!empty($other_orders)) {
+                        $order->update_status('on-hold', sprintf(
+                            /* translators: 1: transaction id, 2: order numbers */
+                            __('WiPay transaction %1$s was already used to pay order(s) %2$s. This order was not marked paid. Check the WiPay dashboard.', 'revamped-wipay-woocommerce'),
+                            $transaction_id,
+                            '#' . implode(', #', $other_orders)
+                        ));
+                        self::log_static('WiPay transaction reuse blocked. order=' . $order_id . ' tx=' . self::mask_id($transaction_id), 'warning');
+                        wc_add_notice(__('Payment verification failed. Please contact the store owner.', 'revamped-wipay-woocommerce'), 'error');
+                        $redirect = wc_get_checkout_url();
+                    } else {
+                        $order->update_meta_data(self::META_PAID_TRANSACTION_ID, $transaction_id);
+                        $order->save();
+                        $order->payment_complete($transaction_id);
+
+                        $note = sprintf(
+                            /* translators: 1: transaction id, 2: message */
+                            __('WiPay payment completed. Transaction ID: %1$s. Message: %2$s', 'revamped-wipay-woocommerce'),
+                            $transaction_id,
+                            $message ? $message : '-'
+                        );
+                        if ('sandbox' === $env) {
+                            $note .= ' ' . __('This was a Sandbox test payment. No money was collected.', 'revamped-wipay-woocommerce');
+                        }
+                        $order->add_order_note($note);
+                        $redirect = $order->get_checkout_order_received_url();
+                    }
+                }
+            } finally {
+                self::release_lock($lock);
+            }
+
+            wp_safe_redirect($redirect);
             exit;
         }
 
-        $order->update_status('failed', $message ? $message : __('WiPay payment failed.', 'revamped-wipay-woocommerce'));
-        wc_add_notice($message ? $message : __('Payment failed. Please try again.', 'revamped-wipay-woocommerce'), 'error');
+        $order->update_status('failed', $message
+            ? sprintf(
+                /* translators: %s: message returned by WiPay */
+                __('WiPay payment failed: %s', 'revamped-wipay-woocommerce'),
+                $message
+            )
+            : __('WiPay payment failed.', 'revamped-wipay-woocommerce'));
+        // The message comes from the return URL, so it stays in the order note
+        // and is not shown on the store's pages.
+        wc_add_notice(__('Your card payment was not completed. Please try again or choose another payment method.', 'revamped-wipay-woocommerce'), 'error');
         wp_safe_redirect(wc_get_checkout_url());
         exit;
     }

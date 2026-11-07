@@ -2,6 +2,32 @@
 
 All notable changes to this plugin are documented in this file. Versions follow semantic versioning.
 
+## [1.3.0] - 2026-11-07
+
+### Security
+- A successful WiPay return now always needs a valid hash. Before, a return was accepted without one when no API key was saved for the environment.
+- One WiPay transaction can pay only one order. A transaction already recorded on another order puts the order on hold with a note instead of marking it paid, and a short database lock stops two returns completing at the same time.
+- The return handler only accepts orders that use WiPay.
+- The failure message in the return URL is no longer shown on the store. It is kept in the order note and customers see a fixed message.
+- Updates are now downloaded and checked against the SHA-256 value published with each release before WordPress installs them. A package with a missing or wrong checksum is refused.
+- Added the `Update URI` header so WordPress never offers a wordpress.org plugin with the same slug as an update.
+- The API base URL override and the payment page URL returned by WiPay must use HTTPS.
+
+### Fixed
+- Updates did not work for copies installed from GitHub. The updater pointed at a repository that does not exist and the 1.2.0 release had no ZIP attached. It now reads releases from `Revamped-GY/Woocomerce-Wipay-Plugin-Revamped` and falls back to the update file on revamped.gy.
+- A failed update check was repeated on every admin page load. It is now remembered for an hour.
+- An update no longer moves the plugin into a different folder, which could leave it deactivated.
+- The stale pending order clean-up was only scheduled on activation, so sites that updated to 1.2.0 never ran it. It is scheduled on load when missing, and it compares order times to the second.
+- The Plugin URI pointed at a page that does not exist.
+
+### Changed
+- WiPay is hidden at checkout when the store currency cannot be charged and Charge currency is set to the store currency. The Overview page explains how to switch to USD.
+- Removed the WooCommerce refund button, which always returned an error. Refund in the WiPay dashboard, then use Refund manually in WooCommerce.
+- A stored exchange rate older than seven days is no longer used when the live rate cannot be fetched. Change this with the `rgy_wipay_fx_fallback_max_age` filter.
+- Sandbox payments add a note to the order saying no money was collected.
+- The Plugins screen uses WordPress's own View details link and auto-update toggle.
+- Tested with WordPress 7.1 and WooCommerce 11.2.
+
 ## [1.2.0] - 2026-04-15
 
 ### Added
