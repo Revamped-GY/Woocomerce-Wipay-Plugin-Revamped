@@ -1,0 +1,152 @@
+name: Release
+
+# A push to main with a new version number creates the GitHub Release that
+# installed copies update from. Pushes at an already released version only
+# run the checks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rgy-wipay-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Check on PHP ${{ matrix.php-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@b604ade2a87db23f8871b7182e69ec5e75effb45 # v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          coverage: none
+
+      - name: Lint PHP
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r -d '' f; do
+            if ! php -l "$f" >/dev/null; then
+              php -l "$f" || true
+              fail=1
+            fi
+          done < <(find . -type f -name '*.php' -not -path './.git/*' -print0)
+          exit "$fail"
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          for t in tests/run-*.php; do
+            php "$t"
+          done
+
+      - name: Check scripts
+        if: matrix.php-version == '8.3'
+        run: |
+          set -euo pipefail
+          for f in assets/js/*.js assets/admin/*.js; do
+            node --check "$f"
+          done
+
+  release:
+    name: Build and publish release
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          header=$(grep -E '^[[:space:]]*\*[[:space:]]*Version:' revamped-wipay-woocommerce.php | head -n1 | sed -E 's/.*Version:[[:space:]]*//')
+          constant=$(grep -E "define\('RGY_WIPAY_WC_VERSION'" revamped-wipay-woocommerce.php | head -n1 | sed -E "s/.*'([0-9][^']*)'\).*/\1/")
+          stable=$(grep -E '^Stable tag:' readme.txt | head -n1 | sed -E 's/Stable tag:[[:space:]]*//')
+          if [ "$header" != "$constant" ] || [ "$header" != "$stable" ]; then
+            echo "::error::Version header ($header), constant ($constant) and Stable tag ($stable) differ."
+            exit 1
+          fi
+          if ! [[ "$header" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version $header is not X.Y.Z."
+            exit 1
+          fi
+          if ! grep -qE "^## \[$header\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for $header."
+            exit 1
+          fi
+          publish=true
+          if gh release view "v$header" >/dev/null 2>&1; then
+            publish=false
+            echo "Release v$header already exists."
+          fi
+          echo "version=$header" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Build ZIP
+        if: steps.ver.outputs.publish == 'true'
+        id: zip
+        run: |
+          set -euo pipefail
+          version='${{ steps.ver.outputs.version }}'
+          name="revamped-wipay-woocommerce-v${version}.zip"
+          rm -rf build
+          mkdir -p build/revamped-wipay-woocommerce
+          # Only the files the plugin needs at run time.
+          cp revamped-wipay-woocommerce.php uninstall.php readme.txt LICENSE build/revamped-wipay-woocommerce/
+          cp -R includes assets build/revamped-wipay-woocommerce/
+          if [ -d languages ]; then cp -R languages build/revamped-wipay-woocommerce/; fi
+          find build -name '.DS_Store' -delete
+          (cd build && zip -qrX "../${name}" revamped-wipay-woocommerce)
+          sha=$(sha256sum "$name" | awk '{print $1}')
+          echo "${sha}  ${name}" > "${name}.sha256"
+          # Fixed name so releases/latest/download/revamped-wipay-woocommerce.zip
+          # always serves the newest package.
+          cp "$name" revamped-wipay-woocommerce.zip
+
+          awk -v v="$version" '
+            $0 ~ ("^## \\[" v "\\]") { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          printf '\nInstall file: `%s`\nSHA-256: `%s`\n' "$name" "$sha" >> release-notes.md
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: steps.ver.outputs.publish == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: v${{ steps.ver.outputs.version }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: |
+            ${{ steps.zip.outputs.name }}
+            ${{ steps.zip.outputs.name }}.sha256
+            revamped-wipay-woocommerce.zip

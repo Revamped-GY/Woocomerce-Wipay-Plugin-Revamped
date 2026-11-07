@@ -1,11 +1,14 @@
 <?php
 /**
- * Self hosted plugin updates using the native WordPress updater,
- * powered by the GitHub Releases API.
+ * Plugin updates through the native WordPress updater.
  *
- * From v1.2.0 onwards, releases are published on GitHub. The plugin
- * checks the latest release tag and uses the attached ZIP asset as
- * the update package.
+ * Updates come from GitHub Releases on Revamped-GY/Woocomerce-Wipay-Plugin-Revamped.
+ * Each release must carry revamped-wipay-woocommerce-vX.Y.Z.zip and its
+ * .zip.sha256 file. The package is downloaded and checked against that hash
+ * before WordPress unpacks it.
+ *
+ * If GitHub cannot be reached, the JSON file on revamped.gy is read instead.
+ * It must name a package on the same host together with its SHA-256 value.
  *
  * @package Revamped_WiPay_WooCommerce
  */
@@ -16,13 +19,18 @@ if (!defined('ABSPATH')) {
 
 final class RGY_WiPay_Updater {
 
+    const DEFAULT_REPO = 'Revamped-GY/Woocomerce-Wipay-Plugin-Revamped';
+    const SLUG = 'revamped-wipay-woocommerce';
+    const CACHE_KEY = 'rgy_wipay_update_info_v2';
+    const FAILURE_KEY = 'rgy_wipay_update_check_failed';
+    const CACHE_TTL = 6 * HOUR_IN_SECONDS;
+    const FAILURE_TTL = HOUR_IN_SECONDS;
+
     private static $instance = null;
 
-    private $cache_key = 'rgy_wipay_update_payload';
+    /** @var array|null|false Request-level cache. False means not loaded yet. */
+    private $remote = false;
 
-    /**
-     * Singleton.
-     */
     public static function instance() {
         if (null === self::$instance) {
             self::$instance = new self();
@@ -31,408 +39,502 @@ final class RGY_WiPay_Updater {
     }
 
     private function __construct() {
-        add_filter('site_transient_update_plugins', array($this, 'inject_update'));
+        add_filter('pre_set_site_transient_update_plugins', array($this, 'inject_update'));
         add_filter('plugins_api', array($this, 'plugins_api'), 20, 3);
-        add_filter('upgrader_source_selection', array($this, 'rename_unpacked_folder'), 10, 4);
+        // Run late so a package supplied by another filter is still checked.
+        add_filter('upgrader_pre_download', array($this, 'download_verified_package'), PHP_INT_MAX, 4);
+        add_filter('upgrader_source_selection', array($this, 'keep_installed_folder'), 10, 4);
+        add_action('upgrader_process_complete', array($this, 'purge_cache'), 10, 2);
+    }
 
-        $plugin_basename = plugin_basename(RGY_WIPAY_WC_FILE);
-        add_filter('plugin_action_links_' . $plugin_basename, array($this, 'add_action_links'));
-        add_filter('plugin_row_meta', array($this, 'add_row_meta_links'), 10, 2);
-        add_action('admin_enqueue_scripts', array($this, 'enqueue_thickbox'));
+    private function plugin_basename() {
+        return plugin_basename(RGY_WIPAY_WC_FILE);
     }
 
     /**
-     * Returns the GitHub repo as owner/repo, filterable.
+     * Repository in owner/name form. Override with RGY_WIPAY_GITHUB_REPO or
+     * the rgy_wipay_github_repo filter.
      */
     public function get_repo() {
-        $repo = defined('RGY_WIPAY_GITHUB_REPO') ? (string) RGY_WIPAY_GITHUB_REPO : '';
-        return (string) apply_filters('rgy_wipay_github_repo', $repo);
+        $repo = defined('RGY_WIPAY_GITHUB_REPO') && is_string(RGY_WIPAY_GITHUB_REPO) && '' !== RGY_WIPAY_GITHUB_REPO
+            ? RGY_WIPAY_GITHUB_REPO
+            : self::DEFAULT_REPO;
+        $repo = (string) apply_filters('rgy_wipay_github_repo', $repo);
+        return preg_match('#^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$#', $repo) ? $repo : '';
     }
 
-    /**
-     * Clears cached remote payload.
-     */
+    private function get_manifest_url() {
+        $url = defined('RGY_WIPAY_UPDATE_JSON_URL') ? (string) RGY_WIPAY_UPDATE_JSON_URL : '';
+        return (string) apply_filters('rgy_wipay_update_json_url', $url);
+    }
+
     public function clear_cache() {
-        delete_transient($this->cache_key);
+        $this->remote = false;
+        delete_site_transient(self::CACHE_KEY);
+        delete_site_transient(self::FAILURE_KEY);
     }
 
     /**
-     * Fetches and validates the latest release from the GitHub API.
+     * Latest release details, cached. A failed check is remembered for an
+     * hour so a GitHub outage or rate limit does not slow every admin page.
+     *
+     * @return array|null
      */
-    public function get_remote_payload($force = false) {
+    public function get_remote_info($force = false) {
+        if (!$force && false !== $this->remote) {
+            return $this->remote;
+        }
+
         if (!$force) {
-            $cached = get_transient($this->cache_key);
-            if (is_array($cached)) {
+            $cached = get_site_transient(self::CACHE_KEY);
+            if (is_array($cached) && !empty($cached['version'])) {
+                $this->remote = $cached;
                 return $cached;
+            }
+            if (get_site_transient(self::FAILURE_KEY)) {
+                $this->remote = null;
+                return null;
             }
         }
 
+        $info = $this->fetch_from_github();
+        if (!$info) {
+            $manifest = $this->get_manifest_url();
+            if ('' !== $manifest) {
+                $info = $this->fetch_from_manifest($manifest);
+            }
+        }
+
+        if ($info) {
+            set_site_transient(self::CACHE_KEY, $info, self::CACHE_TTL);
+            delete_site_transient(self::FAILURE_KEY);
+        } else {
+            set_site_transient(self::FAILURE_KEY, time(), self::FAILURE_TTL);
+            $info = null;
+        }
+
+        $this->remote = $info;
+        return $info;
+    }
+
+    private function request_headers($accept) {
+        return array(
+            'Accept'     => $accept,
+            'User-Agent' => 'Revamped-WiPay-Updater/' . (defined('RGY_WIPAY_WC_VERSION') ? RGY_WIPAY_WC_VERSION : '0'),
+        );
+    }
+
+    /**
+     * @return array|null
+     */
+    private function fetch_from_github() {
         $repo = $this->get_repo();
-        if (empty($repo) || false === strpos($repo, '/')) {
+        if ('' === $repo) {
             return null;
         }
 
-        $url = 'https://api.github.com/repos/' . $repo . '/releases/latest';
+        $headers = $this->request_headers('application/vnd.github+json');
+        $token = (string) apply_filters('rgy_wipay_github_token', '');
+        if ('' !== $token) {
+            $headers['Authorization'] = 'Bearer ' . $token;
+        }
 
-        $response = wp_remote_get($url, array(
-            'timeout' => 15,
-            'headers' => array(
-                'Accept'     => 'application/vnd.github+json',
-                'User-Agent' => 'WordPress; ' . home_url('/'),
-            ),
+        $response = wp_safe_remote_get('https://api.github.com/repos/' . $repo . '/releases/latest', array(
+            'timeout'            => 12,
+            'headers'            => $headers,
+            'reject_unsafe_urls' => true,
         ));
-
-        if (is_wp_error($response)) {
+        if (is_wp_error($response) || 200 !== (int) wp_remote_retrieve_response_code($response)) {
             return null;
         }
 
-        $code = (int) wp_remote_retrieve_response_code($response);
-        if (200 !== $code) {
+        $body = (string) wp_remote_retrieve_body($response);
+        if ('' === $body || strlen($body) > 1024 * 1024) {
             return null;
         }
 
-        $body = wp_remote_retrieve_body($response);
-        if (empty($body)) {
+        $release = json_decode($body, true);
+        if (!is_array($release) || !empty($release['draft']) || !empty($release['prerelease']) || empty($release['tag_name'])) {
+            return null;
+        }
+
+        $version = ltrim((string) $release['tag_name'], 'vV');
+        if (!preg_match('/^\d+\.\d+\.\d+$/', $version)) {
+            return null;
+        }
+
+        // Only the exact package and checksum built by the release workflow count.
+        $zip_name = self::SLUG . '-v' . $version . '.zip';
+        $zip_url = '';
+        $sha_url = '';
+        foreach ((array) ($release['assets'] ?? array()) as $asset) {
+            if (!is_array($asset) || empty($asset['browser_download_url']) || empty($asset['name'])) {
+                continue;
+            }
+            $name = (string) $asset['name'];
+            if ($name === $zip_name) {
+                if ('' !== $zip_url) {
+                    return null;
+                }
+                $zip_url = (string) $asset['browser_download_url'];
+            } elseif ($name === $zip_name . '.sha256') {
+                if ('' !== $sha_url) {
+                    return null;
+                }
+                $sha_url = (string) $asset['browser_download_url'];
+            }
+        }
+
+        $github_hosts = array('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com');
+        if (!$this->is_allowed_url($zip_url, $github_hosts) || !$this->is_allowed_url($sha_url, $github_hosts)) {
+            return null;
+        }
+
+        $sha_response = wp_safe_remote_get($sha_url, array(
+            'timeout'            => 8,
+            'headers'            => $this->request_headers('text/plain'),
+            'reject_unsafe_urls' => true,
+        ));
+        if (is_wp_error($sha_response) || 200 !== (int) wp_remote_retrieve_response_code($sha_response)) {
+            return null;
+        }
+        $sha_body = (string) wp_remote_retrieve_body($sha_response);
+        if (strlen($sha_body) > 4096 || !preg_match('/\b([a-fA-F0-9]{64})\b/', $sha_body, $m)) {
+            return null;
+        }
+
+        $last_updated = '';
+        if (!empty($release['published_at'])) {
+            $ts = strtotime((string) $release['published_at']);
+            $last_updated = $ts ? gmdate('Y-m-d', $ts) : '';
+        }
+
+        return array(
+            'version'        => $version,
+            'download_url'   => $zip_url,
+            'package_sha256' => strtolower($m[1]),
+            'homepage'       => 'https://github.com/' . $repo,
+            'last_updated'   => $last_updated,
+            'changelog'      => $this->markdown_to_html(isset($release['body']) ? (string) $release['body'] : ''),
+            'source'         => 'github',
+        );
+    }
+
+    /**
+     * @return array|null
+     */
+    private function fetch_from_manifest($url) {
+        if (!$this->is_allowed_url($url, null)) {
+            return null;
+        }
+
+        $response = wp_safe_remote_get($url, array(
+            'timeout'            => 12,
+            'headers'            => $this->request_headers('application/json'),
+            'reject_unsafe_urls' => true,
+        ));
+        if (is_wp_error($response) || 200 !== (int) wp_remote_retrieve_response_code($response)) {
+            return null;
+        }
+
+        $body = (string) wp_remote_retrieve_body($response);
+        if ('' === $body || strlen($body) > 256 * 1024) {
             return null;
         }
 
         $data = json_decode($body, true);
-        if (!is_array($data)) {
+        if (!is_array($data) || empty($data['version']) || empty($data['download_url'])) {
             return null;
         }
 
-        $payload = $this->build_payload_from_release($data);
-        if (!$payload) {
+        $version = (string) $data['version'];
+        if (!preg_match('/^\d+\.\d+\.\d+$/', $version)) {
             return null;
         }
 
-        // Cache for 12 hours.
-        set_transient($this->cache_key, $payload, 12 * HOUR_IN_SECONDS);
+        $download_url = (string) $data['download_url'];
+        $manifest_host = strtolower((string) wp_parse_url($url, PHP_URL_HOST));
+        if (!$this->is_allowed_url($download_url, array($manifest_host))) {
+            return null;
+        }
 
-        return $payload;
+        $sha = isset($data['package_sha256']) && is_string($data['package_sha256']) ? strtolower(trim($data['package_sha256'])) : '';
+        if (!preg_match('/^[a-f0-9]{64}$/', $sha)) {
+            return null;
+        }
+
+        $changelog = '';
+        if (!empty($data['sections']['changelog']) && is_string($data['sections']['changelog'])) {
+            $changelog = wp_kses_post($data['sections']['changelog']);
+        }
+
+        return array(
+            'version'        => $version,
+            'download_url'   => $download_url,
+            'package_sha256' => $sha,
+            'homepage'       => !empty($data['homepage']) ? esc_url_raw((string) $data['homepage']) : '',
+            'last_updated'   => !empty($data['last_updated']) ? sanitize_text_field((string) $data['last_updated']) : '',
+            'changelog'      => $changelog,
+            'source'         => 'manifest',
+        );
     }
 
     /**
-     * Builds a payload from a GitHub Release object.
+     * HTTPS only. When $hosts is given, the host must be one of them.
      */
-    private function build_payload_from_release($release) {
-        $tag = isset($release['tag_name']) ? sanitize_text_field((string) $release['tag_name']) : '';
-        if (empty($tag)) {
-            return null;
+    private function is_allowed_url($url, $hosts) {
+        $url = (string) $url;
+        if ('' === $url || 'https' !== strtolower((string) wp_parse_url($url, PHP_URL_SCHEME))) {
+            return false;
+        }
+        $host = strtolower((string) wp_parse_url($url, PHP_URL_HOST));
+        if ('' === $host) {
+            return false;
+        }
+        if (null === $hosts) {
+            return true;
+        }
+        $hosts = (array) apply_filters('rgy_wipay_update_allowed_hosts', $hosts);
+        $hosts = array_filter(array_map('strtolower', array_map('strval', $hosts)));
+        return in_array($host, $hosts, true);
+    }
+
+    private function readme_field($field) {
+        $readme = dirname(RGY_WIPAY_WC_FILE) . '/readme.txt';
+        if (!is_readable($readme)) {
+            return '';
+        }
+        $head = (string) file_get_contents($readme, false, null, 0, 4096);
+        if (preg_match('/^' . preg_quote($field, '/') . ':\s*(.+)$/im', $head, $m)) {
+            return trim($m[1]);
+        }
+        return '';
+    }
+
+    private function update_item(array $remote) {
+        return (object) array(
+            'id'           => $this->plugin_basename(),
+            'slug'         => self::SLUG,
+            'plugin'       => $this->plugin_basename(),
+            'new_version'  => $remote['version'],
+            'url'          => $remote['homepage'] ? $remote['homepage'] : 'https://revamped.gy/wipay-woocommerce-plugin/',
+            'package'      => $remote['download_url'],
+            'tested'       => $this->readme_field('Tested up to'),
+            'requires'     => $this->readme_field('Requires at least'),
+            'requires_php' => $this->readme_field('Requires PHP'),
+            'icons'        => array(),
+            'banners'      => array(),
+        );
+    }
+
+    public function inject_update($transient) {
+        if (!is_object($transient)) {
+            return $transient;
+        }
+        $basename = $this->plugin_basename();
+        if (empty($transient->checked) || !is_array($transient->checked) || empty($transient->checked[$basename])) {
+            return $transient;
         }
 
-        $version = ltrim($tag, 'vV');
-        if (!preg_match('/^\d+(\.\d+)*/', $version)) {
-            return null;
+        $remote = $this->get_remote_info();
+        if (!$remote) {
+            return $transient;
         }
 
-        // Find the first ZIP asset attached to the release.
-        $download_url = '';
-        if (!empty($release['assets']) && is_array($release['assets'])) {
-            foreach ($release['assets'] as $asset) {
-                if (!is_array($asset)) {
-                    continue;
-                }
-                $name = isset($asset['name']) ? (string) $asset['name'] : '';
-                $url  = isset($asset['browser_download_url']) ? (string) $asset['browser_download_url'] : '';
-                if ($name && $url && '.zip' === strtolower(substr($name, -4))) {
-                    $download_url = esc_url_raw($url);
-                    break;
-                }
+        $item = $this->update_item($remote);
+        if (version_compare($remote['version'], (string) $transient->checked[$basename], '>')) {
+            $transient->response[$basename] = $item;
+            if (isset($transient->no_update[$basename])) {
+                unset($transient->no_update[$basename]);
+            }
+        } else {
+            // Listing the plugin here lets WordPress show View details and the
+            // auto-update toggle for it.
+            $transient->no_update[$basename] = $item;
+            if (isset($transient->response[$basename])) {
+                unset($transient->response[$basename]);
             }
         }
 
-        if (empty($download_url)) {
-            return null;
+        return $transient;
+    }
+
+    public function plugins_api($result, $action, $args) {
+        if ('plugin_information' !== $action || empty($args->slug) || self::SLUG !== $args->slug) {
+            return $result;
         }
 
-        $homepage = 'https://github.com/' . $this->get_repo();
+        $remote = $this->get_remote_info();
+        if (!$remote) {
+            return $result;
+        }
 
-        $body_md = isset($release['body']) ? (string) $release['body'] : '';
-        $changelog_html = $this->markdown_to_html($body_md);
-
-        $published_at = isset($release['published_at']) ? sanitize_text_field((string) $release['published_at']) : '';
-        $last_updated = $published_at ? gmdate('Y-m-d H:i', strtotime($published_at)) : '';
-
-        return array(
-            'name'         => 'Revamped WiPay Gateway for WooCommerce',
-            'slug'         => 'revamped-wipay-woocommerce',
-            'version'      => $version,
-            'download_url' => $download_url,
-            'homepage'     => $homepage,
-            'tested'       => '6.7',
-            'requires'     => '6.0',
-            'requires_php' => '7.4',
-            'last_updated' => $last_updated,
-            'sections'     => array(
-                'description'  => $this->get_static_description(),
-                'installation' => $this->get_static_installation(),
-                'changelog'    => $changelog_html,
+        return (object) array(
+            'name'          => 'Revamped WiPay Gateway for WooCommerce',
+            'slug'          => self::SLUG,
+            'version'       => $remote['version'],
+            'author'        => '<a href="https://revamped.gy">Revamped GY</a>',
+            'homepage'      => 'https://revamped.gy/wipay-woocommerce-plugin/',
+            'download_link' => $remote['download_url'],
+            'requires'      => $this->readme_field('Requires at least'),
+            'tested'        => $this->readme_field('Tested up to'),
+            'requires_php'  => $this->readme_field('Requires PHP'),
+            'last_updated'  => $remote['last_updated'],
+            'sections'      => array(
+                'description'  => $this->description_html(),
+                'installation' => $this->installation_html(),
+                'changelog'    => '' !== $remote['changelog'] ? $remote['changelog'] : '<p>See the release notes on GitHub.</p>',
             ),
         );
     }
 
     /**
-     * Convert simple markdown (used in GitHub release bodies) to HTML.
-     * Handles headings, bullet lists, paragraphs and links.
+     * Download this plugin's package and check its SHA-256 value before
+     * WordPress unpacks it. Other plugins are left alone.
      */
-    private function markdown_to_html($md) {
-        $md = (string) $md;
-        if ('' === $md) {
-            return '';
+    public function download_verified_package($reply, $package, $upgrader, $hook_extra = array()) {
+        $basename = $this->plugin_basename();
+        $hook_extra = is_array($hook_extra) ? $hook_extra : array();
+
+        if (isset($hook_extra['plugin']) && $hook_extra['plugin'] !== $basename) {
+            return $reply;
+        }
+        if (isset($hook_extra['plugins']) && is_array($hook_extra['plugins']) && !in_array($basename, $hook_extra['plugins'], true)) {
+            return $reply;
         }
 
-        $md = str_replace(array("\r\n", "\r"), "\n", $md);
-        $lines = explode("\n", $md);
+        $remote = $this->get_remote_info();
+        $is_ours = (isset($hook_extra['plugin']) && $hook_extra['plugin'] === $basename)
+            || (isset($hook_extra['plugins']) && is_array($hook_extra['plugins']) && in_array($basename, $hook_extra['plugins'], true))
+            || ($remote && is_string($package) && $package === $remote['download_url']);
+        if (!$is_ours || is_wp_error($reply)) {
+            return $reply;
+        }
 
-        $html = '';
-        $in_list = false;
+        if (!$remote || !is_string($package) || $package !== $remote['download_url']) {
+            return new WP_Error('rgy_wipay_update_package', __('The WiPay update package does not match the published release. Update stopped.', 'revamped-wipay-woocommerce'));
+        }
+        $expected = strtolower((string) $remote['package_sha256']);
+        if (!preg_match('/^[a-f0-9]{64}$/', $expected)) {
+            return new WP_Error('rgy_wipay_update_hash_missing', __('The WiPay update has no SHA-256 value. Update stopped.', 'revamped-wipay-woocommerce'));
+        }
 
-        foreach ($lines as $line) {
-            $line = rtrim($line);
-
-            if (preg_match('/^(#{1,6})\s+(.+)$/', $line, $m)) {
-                if ($in_list) { $html .= "</ul>\n"; $in_list = false; }
-                $level = strlen($m[1]);
-                $level = min(6, max(2, $level + 1));
-                $html .= '<h' . $level . '>' . esc_html(trim($m[2])) . '</h' . $level . ">\n";
-                continue;
+        if (is_string($reply) && '' !== $reply) {
+            $file = $reply;
+        } elseif (false === $reply) {
+            if (!function_exists('download_url')) {
+                require_once ABSPATH . 'wp-admin/includes/file.php';
             }
-
-            if (preg_match('/^[\-\*]\s+(.+)$/', $line, $m)) {
-                if (!$in_list) { $html .= "<ul>\n"; $in_list = true; }
-                $html .= '<li>' . $this->inline_md($m[1]) . "</li>\n";
-                continue;
-            }
-
-            if ('' === trim($line)) {
-                if ($in_list) { $html .= "</ul>\n"; $in_list = false; }
-                continue;
-            }
-
-            if ($in_list) { $html .= "</ul>\n"; $in_list = false; }
-            $html .= '<p>' . $this->inline_md($line) . "</p>\n";
+            $file = download_url($package, 300);
+        } else {
+            return new WP_Error('rgy_wipay_update_download', __('The WiPay update download could not be checked. Update stopped.', 'revamped-wipay-woocommerce'));
         }
 
-        if ($in_list) { $html .= "</ul>\n"; }
+        if (is_wp_error($file)) {
+            return $file;
+        }
+        if (!is_string($file) || !is_file($file)) {
+            return new WP_Error('rgy_wipay_update_file', __('The WiPay update file is missing. Update stopped.', 'revamped-wipay-woocommerce'));
+        }
 
-        return $html;
+        $actual = hash_file('sha256', $file);
+        if (!is_string($actual) || !hash_equals($expected, strtolower($actual))) {
+            wp_delete_file($file);
+            return new WP_Error('rgy_wipay_update_hash_mismatch', __('The WiPay update file failed its SHA-256 check. Update stopped.', 'revamped-wipay-woocommerce'));
+        }
+
+        return $file;
     }
 
     /**
-     * Convert inline markdown (links, code, bold, italic) to HTML.
+     * Keep the folder the plugin is installed in. Without this a site that
+     * installed from a renamed folder would lose the plugin's active state
+     * after the update.
      */
-    private function inline_md($text) {
-        $text = esc_html($text);
-        // Links: [text](url)
-        $text = preg_replace_callback('/\[([^\]]+)\]\(([^)]+)\)/', function($m) {
-            return '<a href="' . esc_url($m[2]) . '" target="_blank" rel="noopener noreferrer">' . $m[1] . '</a>';
-        }, $text);
-        // Inline code: `code`
-        $text = preg_replace('/`([^`]+)`/', '<code>$1</code>', $text);
-        // Bold: **text**
-        $text = preg_replace('/\*\*([^\*]+)\*\*/', '<strong>$1</strong>', $text);
-        // Italic: *text*
-        $text = preg_replace('/(?<!\*)\*(?!\*)([^\*]+)\*(?!\*)/', '<em>$1</em>', $text);
-        return $text;
-    }
-
-    private function get_static_description() {
-        return '<h2>WiPay payments for WooCommerce</h2>
-<p>This plugin adds WiPay as a WooCommerce payment method. Customers are redirected to WiPay\'s hosted payment page to enter card details, then return to your site where WooCommerce updates the order.</p>
-<ul>
-  <li>Hosted redirect checkout flow with Sandbox and Live environments</li>
-  <li>WooCommerce Classic Checkout and Blocks Checkout support</li>
-  <li>Optional USD charging with live FX conversion and rounding up to the next whole USD at checkout</li>
-  <li>Security hardened return handling with signed return token, transaction matching and replay protection</li>
-  <li>Native WordPress updates via GitHub Releases</li>
-</ul>';
-    }
-
-    private function get_static_installation() {
-        return '<h2>Installation</h2>
-<ol>
-  <li>Install the plugin ZIP in WordPress, then activate the plugin.</li>
-  <li>Go to WooCommerce &gt; Settings &gt; Payments and enable WiPay.</li>
-  <li>Open the WiPay settings and enter your account number and API key.</li>
-  <li>If your store currency is not supported by WiPay, set Charge currency to USD.</li>
-  <li>Test in Sandbox first, then switch to Live for production.</li>
-</ol>
-<h2>Updates</h2>
-<p>The plugin checks GitHub Releases for new versions automatically. WordPress shows updates on the Plugins page and in Dashboard &gt; Updates.</p>';
-    }
-
-    /**
-     * Inject update data into the WordPress update transient.
-     */
-    public function inject_update($transient) {
-        if (empty($transient) || !is_object($transient) || empty($transient->checked) || !is_array($transient->checked)) {
-            return $transient;
-        }
-
-        $payload = $this->get_remote_payload(false);
-        if (!$payload) {
-            return $transient;
-        }
-
-        $plugin_basename = plugin_basename(RGY_WIPAY_WC_FILE);
-        if (empty($transient->checked[$plugin_basename])) {
-            return $transient;
-        }
-
-        $current_version = (string) $transient->checked[$plugin_basename];
-        if (version_compare($payload['version'], $current_version, '<=')) {
-            return $transient;
-        }
-
-        $update = new stdClass();
-        $update->slug = $payload['slug'];
-        $update->plugin = $plugin_basename;
-        $update->new_version = $payload['version'];
-        $update->url = $payload['homepage'];
-        $update->package = $payload['download_url'];
-
-        if (!empty($payload['tested'])) {
-            $update->tested = $payload['tested'];
-        }
-        if (!empty($payload['requires'])) {
-            $update->requires = $payload['requires'];
-        }
-        if (!empty($payload['requires_php'])) {
-            $update->requires_php = $payload['requires_php'];
-        }
-
-        $transient->response[$plugin_basename] = $update;
-        return $transient;
-    }
-
-    /**
-     * Provide plugin details modal content via plugins_api.
-     */
-    public function plugins_api($result, $action, $args) {
-        if ('plugin_information' !== $action) {
-            return $result;
-        }
-
-        if (empty($args->slug)) {
-            return $result;
-        }
-
-        $payload = $this->get_remote_payload(false);
-        if (!$payload) {
-            return $result;
-        }
-
-        if ((string) $args->slug !== (string) $payload['slug']) {
-            return $result;
-        }
-
-        $info = new stdClass();
-        $info->name = $payload['name'];
-        $info->slug = $payload['slug'];
-        $info->version = $payload['version'];
-        $info->author = '<a href="https://revamped.gy">Revamped GY</a>';
-        $info->homepage = $payload['homepage'];
-        $info->download_link = $payload['download_url'];
-
-        if (!empty($payload['requires'])) {
-            $info->requires = $payload['requires'];
-        }
-        if (!empty($payload['requires_php'])) {
-            $info->requires_php = $payload['requires_php'];
-        }
-        if (!empty($payload['tested'])) {
-            $info->tested = $payload['tested'];
-        }
-        if (!empty($payload['last_updated'])) {
-            $info->last_updated = $payload['last_updated'];
-        }
-
-        $info->sections = array(
-            'description'  => isset($payload['sections']['description']) ? $payload['sections']['description'] : '',
-            'installation' => isset($payload['sections']['installation']) ? $payload['sections']['installation'] : '',
-            'changelog'    => isset($payload['sections']['changelog']) ? $payload['sections']['changelog'] : '',
-        );
-
-        return $info;
-    }
-
-    /**
-     * GitHub release ZIP assets may unpack into a folder name that
-     * differs from the plugin slug. Rename the folder before WordPress
-     * moves it into wp-content/plugins so the plugin slug stays stable.
-     */
-    public function rename_unpacked_folder($source, $remote_source, $upgrader, $hook_extra = array()) {
-        if (is_wp_error($source)) {
+    public function keep_installed_folder($source, $remote_source, $upgrader, $hook_extra = array()) {
+        if (is_wp_error($source) || !is_array($hook_extra) || empty($hook_extra['plugin']) || $hook_extra['plugin'] !== $this->plugin_basename()) {
             return $source;
         }
 
-        if (empty($hook_extra['plugin'])) {
+        $folder = dirname($this->plugin_basename());
+        if ('.' === $folder || '' === $folder) {
             return $source;
         }
 
-        if (plugin_basename(RGY_WIPAY_WC_FILE) !== $hook_extra['plugin']) {
-            return $source;
-        }
-
-        $expected = trailingslashit($remote_source) . 'revamped-wipay-woocommerce/';
-        if (trailingslashit($source) === $expected) {
+        $wanted = trailingslashit($remote_source) . $folder . '/';
+        if (trailingslashit($source) === $wanted) {
             return $source;
         }
 
         global $wp_filesystem;
-        if (!$wp_filesystem) {
+        if (!$wp_filesystem || !$wp_filesystem->exists(trailingslashit($source) . basename(RGY_WIPAY_WC_FILE))) {
             return $source;
         }
-
-        if ($wp_filesystem->move($source, $expected)) {
-            return $expected;
+        if ($wp_filesystem->exists($wanted) || !$wp_filesystem->move($source, $wanted)) {
+            return new WP_Error('rgy_wipay_update_folder', __('The WiPay update could not be placed in the plugin folder.', 'revamped-wipay-woocommerce'));
         }
+        return $wanted;
+    }
 
-        return $source;
+    public function purge_cache($upgrader, $hook_extra) {
+        if (is_array($hook_extra) && isset($hook_extra['type']) && 'plugin' === $hook_extra['type']) {
+            $this->clear_cache();
+        }
     }
 
     /**
-     * Enqueue Thickbox on the Plugins page so "View details" works.
+     * Small Markdown to HTML conversion for GitHub release notes.
      */
-    public function enqueue_thickbox($hook) {
-        if ('plugins.php' !== $hook) {
-            return;
-        }
-        add_thickbox();
-    }
-
-    public function add_action_links($links) {
-        $details = '<a href="' . esc_url($this->get_details_modal_url()) . '" class="thickbox open-plugin-details-modal">' . esc_html__('View details', 'revamped-wipay-woocommerce') . '</a>';
-        array_unshift($links, $details);
-        return $links;
-    }
-
-    public function add_row_meta_links($links, $file) {
-        $plugin_basename = plugin_basename(RGY_WIPAY_WC_FILE);
-        if ($file !== $plugin_basename) {
-            return $links;
-        }
-        $links[] = '<a href="' . esc_url($this->get_details_modal_url()) . '" class="thickbox open-plugin-details-modal">' . esc_html__('View details', 'revamped-wipay-woocommerce') . '</a>';
-        return $links;
-    }
-
-    private function get_details_modal_url() {
-        $slug = 'revamped-wipay-woocommerce';
-        $payload = $this->get_remote_payload(false);
-        if (!empty($payload['slug'])) {
-            $slug = $payload['slug'];
+    private function markdown_to_html($md) {
+        $md = str_replace(array("\r\n", "\r"), "\n", (string) $md);
+        if ('' === trim($md)) {
+            return '';
         }
 
-        return add_query_arg(
-            array(
-                'tab'       => 'plugin-information',
-                'plugin'    => $slug,
-                'TB_iframe' => 'true',
-                'width'     => 600,
-                'height'    => 550,
-            ),
-            admin_url('plugin-install.php')
-        );
+        $html = '';
+        $in_list = false;
+        foreach (explode("\n", $md) as $line) {
+            $line = rtrim($line);
+            if (preg_match('/^(#{1,6})\s+(.+)$/', $line, $m)) {
+                if ($in_list) { $html .= "</ul>\n"; $in_list = false; }
+                $level = min(6, strlen($m[1]) + 1);
+                $html .= '<h' . $level . '>' . esc_html(trim($m[2])) . '</h' . $level . ">\n";
+            } elseif (preg_match('/^[\-\*]\s+(.+)$/', $line, $m)) {
+                if (!$in_list) { $html .= "<ul>\n"; $in_list = true; }
+                $html .= '<li>' . $this->inline_md($m[1]) . "</li>\n";
+            } elseif ('' === trim($line)) {
+                if ($in_list) { $html .= "</ul>\n"; $in_list = false; }
+            } else {
+                if ($in_list) { $html .= "</ul>\n"; $in_list = false; }
+                $html .= '<p>' . $this->inline_md($line) . "</p>\n";
+            }
+        }
+        if ($in_list) {
+            $html .= "</ul>\n";
+        }
+        return wp_kses_post($html);
+    }
+
+    private function inline_md($text) {
+        $text = esc_html($text);
+        $text = preg_replace_callback('/\[([^\]]+)\]\(([^)\s]+)\)/', function ($m) {
+            return '<a href="' . esc_url(html_entity_decode($m[2])) . '" target="_blank" rel="noopener noreferrer">' . $m[1] . '</a>';
+        }, $text);
+        $text = preg_replace('/`([^`]+)`/', '<code>$1</code>', $text);
+        $text = preg_replace('/\*\*([^\*]+)\*\*/', '<strong>$1</strong>', $text);
+        return $text;
+    }
+
+    private function description_html() {
+        return '<p>Adds WiPay as a WooCommerce payment method. Customers pay by card on WiPay\'s hosted page and return to your site, where the order is checked and updated.</p>'
+            . '<ul><li>Sandbox and Live environments</li><li>Classic and Blocks checkout</li><li>Optional USD charging with an exchange rate, rounded up to the next whole dollar</li><li>Signed return links, hash checks and replay protection</li><li>Updates from GitHub Releases, checked by SHA-256 before install</li></ul>';
+    }
+
+    private function installation_html() {
+        return '<ol><li>Upload the ZIP under Plugins, Add New, Upload Plugin, then activate it.</li>'
+            . '<li>Go to WooCommerce, Settings, Payments and enable WiPay.</li>'
+            . '<li>Enter the account number and API key for the environment you use.</li>'
+            . '<li>If WiPay cannot charge your store currency, set Charge currency to USD.</li>'
+            . '<li>Test in Sandbox, then switch to Live.</li></ol>';
     }
 }
