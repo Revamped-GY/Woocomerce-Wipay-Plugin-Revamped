@@ -13,6 +13,9 @@
 
     var settings = getSetting( 'rgy_wipay_data', {} );
 
+    var i18n = window.wp && window.wp.i18n ? window.wp.i18n : null;
+    var __ = i18n && i18n.__ ? i18n.__ : function( s ) { return s; };
+
     var htmlEntities = window.wp && window.wp.htmlEntities ? window.wp.htmlEntities : null;
     var decodeEntities = htmlEntities && htmlEntities.decodeEntities ? htmlEntities.decodeEntities : function( s ) { return s; };
 
@@ -33,7 +36,7 @@
         return el( 'div', null,
             el( 'span', null, description ),
             el( 'br' ),
-            el( 'small', { style: { opacity: 0.7 } }, 'You will be redirected to WiPay to complete payment.' )
+            el( 'small', { style: { opacity: 0.7 } }, __( 'You will be redirected to WiPay to complete payment.', 'revamped-wipay-woocommerce' ) )
         );
     };
 

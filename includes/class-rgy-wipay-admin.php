@@ -207,14 +207,15 @@ public function render_overview() {
         }
 
         // Currency warning when store currency is unsupported and charge mode is store.
-        $wipay_currencies = array('JMD', 'TTD', 'USD');
+        $wipay_currencies = class_exists('RGY_WiPay_Gateway') ? RGY_WiPay_Gateway::supported_currencies() : array('JMD', 'TTD', 'USD');
         if ($store_cur && 'store' === $charge_currency && !in_array($store_cur, $wipay_currencies, true)) {
             echo '<div class="rgy-notice rgy-notice-error">';
             echo '<strong>' . esc_html__('Currency warning:', 'revamped-wipay-woocommerce') . '</strong> ';
             echo esc_html(sprintf(
-                /* translators: %s: currency code */
-                __('Your store currency (%s) is not in WiPay\'s supported list (JMD, TTD, USD). Set Charge currency to USD in the gateway settings, or payments may fail.', 'revamped-wipay-woocommerce'),
-                $store_cur
+                /* translators: 1: currency code, 2: supported currency codes */
+                __('Your store currency (%1$s) is not one WiPay can charge (%2$s). WiPay is hidden at checkout until you set Charge currency to USD in the gateway settings.', 'revamped-wipay-woocommerce'),
+                $store_cur,
+                implode(', ', $wipay_currencies)
             ));
             echo '</div>';
         }
